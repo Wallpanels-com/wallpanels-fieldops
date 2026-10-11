@@ -10,9 +10,9 @@ test('Mini App demo boots without Telegram or network and renders key views',asy
  globalThis.document={querySelector:(selector)=>selector==='#app'?appRoot:null};
  await import('../public/app.js');
  await new Promise(resolve=>setTimeout(resolve,60));
- assert.match(appRoot.innerHTML,/Good (morning|afternoon|evening)/);
+ assert.doesNotMatch(appRoot.innerHTML,/Good (morning|afternoon|evening)/);
  assert.match(appRoot.innerHTML,/Miami Residence/);
- assert.match(appRoot.innerHTML,/DESIGN PREVIEW/);
+ assert.doesNotMatch(appRoot.innerHTML,/preview-banner/);
  assert.match(appRoot.innerHTML,/Active Projects/);
  assert.match(appRoot.innerHTML,/WALLPANELS/);
  const fire=(action,attributes={})=>handlers.click({target:{closest:()=>({dataset:{action,...attributes},classList:{contains:()=>false}})},preventDefault:()=>{}});
