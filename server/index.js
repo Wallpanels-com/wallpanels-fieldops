@@ -1,0 +1,289 @@
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import {fileURLToPath} from 'node:url';
+import {validateTelegramInitData,issueSession,readSession} from './auth.js';
+import {table,insert,update,one,uploadObject,deleteObject,signedUrl,rpc} from './supabase.js';
+import {stagesFor,stageComplete,DAY_CHECKS} from './templates.js';
+import {validateUploadMetadata,inspectUploadStream} from './uploads.js';
+import {assertProjectSubmittable} from './validation.js';
+
+// Minimal no-dependency production server. Uses native Node fetch/stream APIs.
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../public');
+const port=Number(process.env.PORT||3000);
+const SESSION_SECRET=process.env.SESSION_SECRET||'';
+const BOT_TOKEN=process.env.TELEGRAM_BOT_TOKEN||'';
+const ADMIN_ID=String(process.env.BOOTSTRAP_ADMIN_TELEGRAM_ID||'');
+const isPm=u=>u.role==='pm'||u.role==='admin';
+function fail(message,status=400){const e=new Error(message);e.status=status;throw e;}
+function ok(res,data,status=200){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(JSON.stringify(data));}
+function err(res,e){const status=e.status>=400&&e.status<=599?e.status:500;console.error('Request error',status,e.message);ok(res,{error:status===500?'Unexpected server error':e.message},status);}
+async function json(req){const chunks=[];let size=0;for await(const c of req){size+=c.length;if(size>120000)fail('JSON request too large',413);chunks.push(c);}try{return JSON.parse(Buffer.concat(chunks).toString('utf8')||'{}');}catch{fail('Malformed JSON');}}
+const f=(id)=>`eq.${id}`;
+const uuid=(s)=>typeof s==='string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s);
+function str(s,max=300,required=true){const v=String(s??'').trim();if((required&&!v)||v.length>max)fail('Invalid text field');return v;}
+function currentDate(){const parts=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());const obj=Object.fromEntries(parts.map(p=>[p.type,p.value]));return `${obj.year}-${obj.month}-${obj.day}`;}
+function cleanFileName(s){let decoded=String(s||'file');try{decoded=decodeURIComponent(decoded);}catch{}return decoded.normalize('NFKC').replace(/[^a-zA-Z0-9._-]/g,'_').slice(0,70).replace(/^\.+/,'')||'file';}
+function validDate(value){if(!/^\d{4}-\d{2}-\d{2}$/.test(value||''))return false;const d=new Date(`${value}T00:00:00Z`);return !Number.isNaN(d.valueOf())&&d.toISOString().slice(0,10)===value;}
+function requireEnv(){
+ for(const k of ['SUPABASE_URL','SUPABASE_SECRET_KEY','TELEGRAM_BOT_TOKEN','TELEGRAM_BOT_USERNAME','SESSION_SECRET','BOOTSTRAP_ADMIN_TELEGRAM_ID','APP_BASE_URL']) if(!process.env[k]||String(process.env[k]).includes('REPLACE_WITH')) throw new Error(`${k} not configured`);
+ if(SESSION_SECRET.length<40)throw new Error('SESSION_SECRET must have 40+ characters');
+ if(!/^\d{4,20}$/.test(ADMIN_ID))throw new Error('BOOTSTRAP_ADMIN_TELEGRAM_ID must be numeric');
+ if(!/^\d{6,12}:[A-Za-z0-9_-]{20,}$/.test(BOT_TOKEN))throw new Error('TELEGRAM_BOT_TOKEN format is invalid');
+ if(!/^[A-Za-z0-9_]{5,}$/.test(process.env.TELEGRAM_BOT_USERNAME))throw new Error('TELEGRAM_BOT_USERNAME format is invalid');
+ if(!/^https:\/\/[a-z0-9-]+\.up\.railway\.app\/?$/i.test(process.env.APP_BASE_URL))throw new Error('APP_BASE_URL must be the Railway HTTPS domain');
+ if(!/^https:\/\/[a-z0-9]+\.supabase\.co\/?$/i.test(process.env.SUPABASE_URL))throw new Error('SUPABASE_URL format is invalid');
+ if(!process.env.SUPABASE_SECRET_KEY.startsWith('sb_secret_'))throw new Error('SUPABASE_SECRET_KEY must use the new secret key format');
+}
+async function auth(req){const head=String(req.headers.authorization||'');const token=head.startsWith('Bearer ')?head.slice(7):'';const id=readSession(token,SESSION_SECRET);const u=await one('users',{id:f(id)});if(!u||!u.is_active)fail('Account disabled',403);return u;}
+async function projectAccess(u,id,{pmOnly=false}={}){
+ if(!uuid(id))fail('Invalid project ID');
+ const p=await one('projects',{id:f(id)});if(!p)fail('Project not found',404);
+ if(u.role!=='admin' && p.pm_id!==u.id && !(await one('project_members',{project_id:f(id),user_id:f(u.id)})))fail('Project access denied',403);
+ if(pmOnly && !isPm(u))fail('Project Manager required',403);
+ if(pmOnly && u.role==='pm' && p.pm_id!==u.id)fail('Not assigned Project Manager',403);
+ return p;
+}
+async function projectBundle(u,id){
+ const p=await projectAccess(u,id);
+ const [stages,checks,results,media,issues,days,members,exceptions,confirmations,owner]=await Promise.all([
+  table('project_stages',{filters:{project_id:f(id)},order:'sort_order.asc'}),
+  table('stage_check_items',{filters:{project_id:f(id)},order:'sort_order.asc'}),
+  table('stage_check_results',{filters:{project_id:f(id)}}),
+  table('project_media',{filters:{project_id:f(id)},order:'created_at.desc',limit:300}),
+  table('issues',{filters:{project_id:f(id)},order:'created_at.desc'}),
+  table('daily_reports',{filters:{project_id:f(id)},order:'report_date.desc'}),
+  table('project_members',{filters:{project_id:f(id)}}),
+  table('stage_exceptions',{filters:{project_id:f(id)}}),
+  one('client_confirmations',{project_id:f(id)}),
+  p.pm_id?one('users',{id:f(p.pm_id)}):null
+ ]);
+ const users=await table('users',{filters:{id:`in.(${[...new Set([...members.map(m=>m.user_id),p.pm_id].filter(Boolean))].join(',')})`}}).catch(()=>[]);
+ const mappedChecks=checks.map(c=>({...c,result_status:results.find(x=>x.check_item_id===c.id)?.status||'pending',completed_by:results.find(x=>x.check_item_id===c.id)?.completed_by||null}));
+ const signedMedia=await Promise.all(media.map(async m=>({...m,url:await signedUrl(m.storage_path).catch(()=>null)})));
+ const enriched=stages.map(s=>({...s,completion:stageComplete(s,media,mappedChecks,exceptions)}));
+ return {project:p,stages:enriched,checks:mappedChecks,media:signedMedia,issues,days,members,people:users,exceptions,confirmation:confirmations,pm:owner?{id:owner.id,first_name:owner.first_name,telegram_id:owner.telegram_id}:null,dayChecks:DAY_CHECKS};
+}
+async function sendTelegram(chatId,text,extra={}){
+ if(!BOT_TOKEN||!chatId)return;
+ try{const c=new AbortController();const t=setTimeout(()=>c.abort(),9000);const r=await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chatId,text,...extra}),signal:c.signal});clearTimeout(t);if(!r.ok)console.error('Telegram notification failed',r.status);}catch(e){console.error('Telegram notification transport error',e.message);}
+}
+async function notifyPM(project,text){if(!project.pm_id)return;const pm=await one('users',{id:f(project.pm_id)});if(pm)void sendTelegram(pm.telegram_id,text);}
+async function notifyCrew(project,text){const members=await table('project_members',{filters:{project_id:f(project.id)}});for(const m of members){const person=await one('users',{id:f(m.user_id)});if(person?.is_active)void sendTelegram(person.telegram_id,text);}}
+function parseId(pathname,prefix){const m=pathname.match(new RegExp(`^${prefix}/([0-9a-f-]{36})$`,'i'));return m?.[1]||null;}
+
+async function api(req,res,uri){
+ const {pathname}=uri, method=req.method;
+ if(pathname==='/api/health'&&method==='GET')return ok(res,{ok:true,service:'wallpanels-fieldops',time:new Date().toISOString()});
+ if(pathname==='/api/auth/telegram'&&method==='POST'){
+  const data=await json(req);let tg;
+  if(process.env.NODE_ENV!=='production'&&process.env.ALLOW_DEV_AUTH==='true'&&data?.dev===true&&process.env.DEV_AUTH_TG_ID) tg={id:Number(process.env.DEV_AUTH_TG_ID),first_name:'Developer',username:'localdev'};
+  else tg=validateTelegramInitData(data.initData,BOT_TOKEN);
+  const tgId=String(tg.id);let user=await one('users',{telegram_id:f(tgId)});
+  if(!user&&tgId===ADMIN_ID){const created=await insert('users',{telegram_id:tgId,first_name:tg.first_name||'Admin',last_name:tg.last_name||'',username:tg.username||null,role:'admin',is_active:true});user=created[0];}
+  if(!user)fail('Access by invitation only. Ask your Project Manager to add your Telegram ID.',403);
+  if(!user.is_active)fail('Account disabled',403);
+  const updated=await update('users',{username:tg.username||null,first_name:tg.first_name||user.first_name,last_name:tg.last_name||user.last_name},{id:f(user.id)});
+  user=updated[0]||user;
+  return ok(res,{token:issueSession(user.id,SESSION_SECRET),user});
+ }
+ const u=await auth(req);
+ if(pathname==='/api/me'&&method==='GET')return ok(res,{user:u});
+ if(pathname==='/api/users'&&method==='GET'){
+  if(!isPm(u))fail('Restricted to Project Managers',403);
+  const people=await table('users',{order:'first_name.asc'});
+  return ok(res,{people:people.map(x=>({id:x.id,telegram_id:x.telegram_id,first_name:x.first_name,last_name:x.last_name,role:x.role,is_active:x.is_active}))});
+ }
+ if(pathname==='/api/users'&&method==='POST'){
+  if(!isPm(u))fail('Restricted to Project Managers',403);
+  const b=await json(req);const id=String(b.telegram_id||'');
+  if(!/^\d{4,20}$/.test(id))fail('Valid numeric Telegram ID required');
+  let role=b.role==='pm'?'pm':'installer';if(role==='pm'&&u.role!=='admin')fail('Only admin can add Project Managers',403);
+  const existing=await one('users',{telegram_id:f(id)});if(existing)fail('User already exists',409);
+  const p=await insert('users',{telegram_id:id,first_name:str(b.first_name,100),last_name:str(b.last_name||'',100,false),role,username:null,is_active:true});return ok(res,{user:p[0]},201);
+ }
+ if(pathname==='/api/projects'&&method==='GET'){
+  let projects;
+  if(u.role==='admin')projects=await table('projects',{order:'created_at.desc',limit:100});
+  else if(u.role==='pm')projects=await table('projects',{filters:{pm_id:f(u.id)},order:'created_at.desc',limit:100});
+  else {const memberships=await table('project_members',{filters:{user_id:f(u.id)}});projects=memberships.length?await table('projects',{filters:{id:`in.(${memberships.map(x=>x.project_id).join(',')})`},order:'created_at.desc',limit:100}):[];}
+  return ok(res,{projects});
+ }
+ if(pathname==='/api/projects'&&method==='POST'){
+  if(!isPm(u))fail('PM required',403);const b=await json(req);
+  const type=['installation','repair','punch_list'].includes(b.type)?b.type:'installation';
+  const code=`WP-${new Date().getFullYear().toString().slice(2)}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+  const scheduled=b.scheduled_for||null;if(scheduled&&!validDate(scheduled))fail('Invalid scheduled date');
+  const payload={p_code:code,p_title:str(b.title,120),p_address:str(b.address,300),p_client_name:str(b.client_name||'',120,false),p_scheduled_for:scheduled,p_project_type:type,p_notes:str(b.notes||'',2000,false),p_pm_id:u.id,p_created_by:u.id,p_stages:stagesFor(type)};
+  const p=(await rpc('fieldops_create_project',payload))[0];
+  if(!p)fail('Project creation failed',502);
+  return ok(res,{project:p},201);
+ }
+ let match=pathname.match(/^\/api\/projects\/([0-9a-f-]{36})$/i);
+ if(match&&method==='GET')return ok(res,await projectBundle(u,match[1]));
+ match=pathname.match(/^\/api\/projects\/([0-9a-f-]{36})\/assign$/i);
+ if(match&&method==='POST'){
+  const p=await projectAccess(u,match[1],{pmOnly:true});const b=await json(req);
+  if(!['active','needs_changes'].includes(p.status))fail('Project is locked',409);
+  if(!uuid(b.user_id))fail('Select a worker');const user=await one('users',{id:f(b.user_id)});if(!user||!user.is_active||user.role!=='installer')fail('Choose an active installer');
+  const members=await insert('project_members',{project_id:p.id,user_id:user.id,role:'installer'},{upsert:true,conflict:'project_id,user_id'});
+  void sendTelegram(user.telegram_id,`WallPanels FieldOps\nAssigned: ${p.title}\n${p.address}\nOpen @${process.env.TELEGRAM_BOT_USERNAME||'your bot'} to view the project.`);
+  return ok(res,{member:members[0]},201);
+ }
+ match=pathname.match(/^\/api\/stages\/([0-9a-f-]{36})\/categories$/i);
+ if(match&&method==='POST'){
+  const stage=await one('project_stages',{id:f(match[1])});if(!stage)fail('Stage missing',404);
+  const project=await projectAccess(u,stage.project_id,{pmOnly:true});if(!['active','needs_changes'].includes(project.status))fail('Project is locked',409);
+  const body=await json(req);const label=str(body.label,90);const kind=body.kind==='video'?'video':'image';
+  if((stage.media_requirements||[]).length>=25)fail('Maximum 25 categories per stage',409);
+  const entry={key:`custom_${crypto.randomBytes(5).toString('hex')}`,label,kind,required:body.required===true};
+  const result=await update('project_stages',{media_requirements:[...(stage.media_requirements||[]),entry]},{id:f(stage.id)});
+  return ok(res,{stage:result[0]},201);
+ }
+ match=pathname.match(/^\/api\/checks\/([0-9a-f-]{36})$/i);
+ if(match&&method==='POST'){
+  const item=await one('stage_check_items',{id:f(match[1])});if(!item)fail('Checklist item not found',404);
+  const project=await projectAccess(u,item.project_id);if(!['active','needs_changes'].includes(project.status))fail('Project locked for editing',409);const b=await json(req);
+  const status=b.done===true?'done':'pending';const out=await insert('stage_check_results',{project_id:item.project_id,check_item_id:item.id,status,completed_by:status==='done'?u.id:null,updated_at:new Date().toISOString()},{upsert:true,conflict:'check_item_id'});
+  return ok(res,{result:out[0]});
+ }
+ match=pathname.match(/^\/api\/projects\/([0-9a-f-]{36})\/media$/i);
+ if(match&&method==='POST'){
+  const p=await projectAccess(u,match[1]);if(!['active','needs_changes'].includes(p.status))fail('Project is locked for editing',409);
+  const stageId=uri.searchParams.get('stage_id'), dayId=uri.searchParams.get('day_id'), issueId=uri.searchParams.get('issue_id'),category=uri.searchParams.get('category');
+  if(!/^[a-z0-9_]{2,45}$/.test(category||''))fail('Invalid photo category');
+  if([stageId,dayId,issueId].filter(Boolean).length!==1)fail('Specify exactly one stage, day report or issue');
+  let stage=null,day=null,issue=null;
+  if(stageId){if(!uuid(stageId))fail('Invalid stage');stage=await one('project_stages',{id:f(stageId),project_id:f(p.id)});if(!stage)fail('Stage not part of project');}
+  if(issueId){if(!uuid(issueId))fail('Invalid issue');issue=await one('issues',{id:f(issueId),project_id:f(p.id)});if(!issue)fail('Issue not found');if(issue.status!=='open')fail('Resolved issue evidence is locked',409);if(category!=='issue_evidence')fail('Issue category invalid');}
+  if(dayId){if(!uuid(dayId))fail('Invalid day');day=await one('daily_reports',{id:f(dayId),project_id:f(p.id)});if(!day||!['open','changes'].includes(day.status))fail('Daily report not editable',409);if(category!=='daily_site')fail('Day category invalid');}
+  const mime=String(req.headers['content-type']||'').split(';')[0].toLowerCase();const size=Number(req.headers['content-length']);
+  const {kind,extension:ext}=validateUploadMetadata(mime,size);
+  if(stage){const requirement=(stage.media_requirements||[]).find(r=>r.key===category);if(!requirement||requirement.kind!==kind)fail('File type does not match selected category');}
+  const storagePath=`projects/${p.id}/${crypto.randomUUID()}.${ext}`;const filename=cleanFileName(req.headers['x-file-name']);
+  const uploadStream=await inspectUploadStream(req,mime,size);
+  await uploadObject(storagePath,uploadStream,mime,size);
+  try{
+    const items=await insert('project_media',{project_id:p.id,stage_id:stage?.id||null,daily_report_id:day?.id||null,issue_id:issue?.id||null,category_key:category,kind,file_name:filename,mime_type:mime,byte_size:size,storage_path:storagePath,uploaded_by:u.id});
+    return ok(res,{media:{...items[0],url:await signedUrl(storagePath)}},201);
+  }catch(e){try{await deleteObject(storagePath);}catch{}throw e;}
+ }
+ match=pathname.match(/^\/api\/projects\/([0-9a-f-]{36})\/days$/i);
+ if(match&&method==='POST'){
+  const p=await projectAccess(u,match[1]);if(!['active','needs_changes'].includes(p.status))fail('Project locked',409);
+  const b=await json(req);const date=b.report_date||currentDate();if(!validDate(date))fail('Invalid report date');
+  let day=await one('daily_reports',{project_id:f(p.id),report_date:f(date)});
+  if(!day)day=(await insert('daily_reports',{project_id:p.id,report_date:date,created_by:u.id,checks:{},status:'open'}))[0];
+  return ok(res,{day});
+ }
+ match=pathname.match(/^\/api\/days\/([0-9a-f-]{36})\/check$/i);
+ if(match&&method==='POST'){
+  const day=await one('daily_reports',{id:f(match[1])});if(!day)fail('Report missing',404);const project=await projectAccess(u,day.project_id);if(!['active','needs_changes'].includes(project.status))fail('Project locked',409);
+  if(!['open','changes'].includes(day.status))fail('Report locked',409);
+  const b=await json(req);if(!DAY_CHECKS.some(c=>c.key===b.key)||typeof b.done!=='boolean')fail('Invalid checklist item');
+  const checks={...(day.checks||{}),[b.key]:b.done};const out=await update('daily_reports',{checks},{id:f(day.id)});return ok(res,{day:out[0]});
+ }
+ match=pathname.match(/^\/api\/days\/([0-9a-f-]{36})\/submit$/i);
+ if(match&&method==='POST'){
+  const day=await one('daily_reports',{id:f(match[1])});if(!day)fail('Report missing',404);const p=await projectAccess(u,day.project_id);
+  if(!['open','changes'].includes(day.status))fail('Report not editable',409);
+  const photos=await table('project_media',{filters:{daily_report_id:f(day.id)}});
+  if(!photos.some(x=>x.kind==='image'&&x.category_key==='daily_site'))fail('Upload at least one end-of-day photo',409);
+  const missing=DAY_CHECKS.filter(c=>!day.checks?.[c.key]);if(missing.length)fail(`Complete daily checklist: ${missing.map(x=>x.label).join(', ')}`,409);
+  const r=await update('daily_reports',{status:'submitted',submitted_at:new Date().toISOString(),submitted_by:u.id},{id:f(day.id)});
+  await notifyPM(p,`FieldOps: End-of-day report submitted\n${p.title}\n${day.report_date}`);return ok(res,{day:r[0]});
+ }
+ match=pathname.match(/^\/api\/days\/([0-9a-f-]{36})\/review$/i);
+ if(match&&method==='POST'){
+  const day=await one('daily_reports',{id:f(match[1])});if(!day)fail('Report missing',404);await projectAccess(u,day.project_id,{pmOnly:true});
+  if(!['submitted','approved'].includes(day.status))fail('Report not submitted',409);const b=await json(req);
+  if(!['approved','changes'].includes(b.status))fail('Invalid review status');
+  if(b.status==='changes'&&!String(b.note||'').trim())fail('Reason required');
+  if(day.submitted_by===u.id&&u.role!=='admin')fail('Self-approval is restricted',403);
+  const r=await update('daily_reports',{status:b.status,pm_note:String(b.note||'').slice(0,1500),reviewed_by:u.id,reviewed_at:new Date().toISOString()},{id:f(day.id)});const worker=day.submitted_by?await one('users',{id:f(day.submitted_by)}):null;if(worker)void sendTelegram(worker.telegram_id,`FieldOps: Daily report ${b.status}\n${day.report_date}\n${b.note||''}`);return ok(res,{day:r[0]});
+ }
+ match=pathname.match(/^\/api\/projects\/([0-9a-f-]{36})\/issues$/i);
+ if(match&&method==='POST'){
+  const p=await projectAccess(u,match[1]);if(!['active','needs_changes'].includes(p.status))fail('Project locked',409);const b=await json(req);
+  const kind=['damage','quality','change_request','other'].includes(b.kind)?b.kind:'other';
+  const issue=(await insert('issues',{project_id:p.id,reported_by:u.id,kind,title:str(b.title,120),description:str(b.description,1500),status:'open'}))[0];
+  await notifyPM(p,`FieldOps ISSUE — ${p.title}\n${issue.title}\nType: ${kind}\nReview immediately. Any affected work must stop pending instructions.`);
+  return ok(res,{issue},201);
+ }
+ match=pathname.match(/^\/api\/issues\/([0-9a-f-]{36})\/resolve$/i);
+ if(match&&method==='POST'){
+  const issue=await one('issues',{id:f(match[1])});if(!issue)fail('Issue not found',404);await projectAccess(u,issue.project_id,{pmOnly:true});const b=await json(req);
+  if(['damage','quality'].includes(issue.kind)&&!(await one('project_media',{issue_id:f(issue.id),kind:'eq.image'})))fail('Add photographic evidence before resolving this issue',409);
+  const result=(await update('issues',{status:'resolved',resolution:str(b.resolution,1500),resolved_by:u.id,resolved_at:new Date().toISOString()},{id:f(issue.id)}))[0];const reporter=await one('users',{id:f(issue.reported_by)});if(reporter)void sendTelegram(reporter.telegram_id,`FieldOps issue resolved: ${issue.title}\n${result.resolution}`);return ok(res,{issue:result});
+ }
+ match=pathname.match(/^\/api\/projects\/([0-9a-f-]{36})\/exceptions$/i);
+ if(match&&method==='POST'){
+  const p=await projectAccess(u,match[1]);if(!['active','needs_changes'].includes(p.status))fail('Project locked',409);const b=await json(req);
+  const stage=await one('project_stages',{id:f(b.stage_id),project_id:f(p.id)});if(!stage)fail('Invalid stage');
+  const target=(stage.media_requirements||[]).find(x=>x.key===b.category_key&&x.required);if(!target)fail('Exception not applicable');
+  if(['before_video','after_video','flags'].includes(target.key))fail('This evidence is mandatory and cannot be marked N/A',409);
+  const existing=await one('stage_exceptions',{stage_id:f(stage.id),category_key:f(b.category_key)});
+  if(existing?.status==='approved')fail('Already approved',409);
+  const payload={project_id:p.id,stage_id:stage.id,category_key:target.key,reason:str(b.reason,500),requested_by:u.id,status:'pending',reviewed_by:null,reviewed_at:null};
+  const entry=existing?(await update('stage_exceptions',payload,{id:f(existing.id)}))[0]:(await insert('stage_exceptions',payload))[0];
+  await notifyPM(p,`FieldOps: N/A approval requested\n${p.title}\n${stage.title} → ${target.label}\nReason: ${payload.reason}`);
+  return ok(res,{exception:entry});
+ }
+ match=pathname.match(/^\/api\/exceptions\/([0-9a-f-]{36})\/review$/i);
+ if(match&&method==='POST'){
+  const item=await one('stage_exceptions',{id:f(match[1])});if(!item)fail('Exception missing',404);await projectAccess(u,item.project_id,{pmOnly:true});const b=await json(req);
+  if(!['approved','rejected'].includes(b.status))fail('Invalid status');
+  const r=(await update('stage_exceptions',{status:b.status,reviewed_by:u.id,reviewed_at:new Date().toISOString()},{id:f(item.id)}))[0];const requester=await one('users',{id:f(item.requested_by)});if(requester)void sendTelegram(requester.telegram_id,`FieldOps photo exception ${b.status}\n${item.category_key}`);return ok(res,{exception:r});
+ }
+ match=pathname.match(/^\/api\/projects\/([0-9a-f-]{36})\/confirmation$/i);
+ if(match&&method==='POST'){
+  const p=await projectAccess(u,match[1]);if(!['active','needs_changes'].includes(p.status))fail('Project locked',409);const b=await json(req);
+  if(!['signed','refused'].includes(b.outcome))fail('Choose signed or refused');
+  const notes=str(b.notes||'',1000,false);if(b.outcome==='refused'&&!notes)fail('Reason for refusal is required');
+  const r=await insert('client_confirmations',{project_id:p.id,outcome:b.outcome,notes,recorded_by:u.id,recorded_at:new Date().toISOString()},{upsert:true,conflict:'project_id'});return ok(res,{confirmation:r[0]});
+ }
+ match=pathname.match(/^\/api\/projects\/([0-9a-f-]{36})\/submit$/i);
+ if(match&&method==='POST'){
+  const p=await projectAccess(u,match[1]);if(!['active','needs_changes'].includes(p.status))fail('Project cannot be submitted',409);
+  const bundle=await projectBundle(u,p.id);assertProjectSubmittable(bundle);
+  const result=(await update('projects',{status:'in_review',submitted_by:u.id,submitted_at:new Date().toISOString()},{id:f(p.id)}))[0];await notifyPM(p,`FieldOps: Project ready for review\n${p.title}`);return ok(res,{project:result});
+ }
+ match=pathname.match(/^\/api\/projects\/([0-9a-f-]{36})\/review$/i);
+ if(match&&method==='POST'){
+  const p=await projectAccess(u,match[1],{pmOnly:true});if(p.status!=='in_review')fail('Project not in review',409);
+  if(p.submitted_by===u.id&&u.role!=='admin')fail('Self-approval restricted',403);const b=await json(req);
+  if(!['completed','needs_changes'].includes(b.status))fail('Invalid review');const note=str(b.note||'',1000,false);
+  if(b.status==='needs_changes'&&!note)fail('Please explain requested changes');
+  const result=(await update('projects',{status:b.status,review_note:note,reviewed_by:u.id,reviewed_at:new Date().toISOString()},{id:f(p.id)}))[0];await notifyCrew(p,`FieldOps project ${b.status==='completed'?'approved':'returned for corrections'}\n${p.title}${note?'\nPM: '+note:''}`);return ok(res,{project:result});
+ }
+ fail('API route not found',404);
+}
+const mimeMap={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.svg':'image/svg+xml','.webmanifest':'application/manifest+json','.png':'image/png','.ico':'image/x-icon'};
+async function serve(req,res,pathname){
+  let p=pathname==='/'?'/index.html':pathname;
+  try{p=decodeURIComponent(p);}catch{return fail('Bad URL');}
+  const file=path.resolve(root,`.${p}`);
+  if(!file.startsWith(root+path.sep)||!fs.existsSync(file)||!fs.statSync(file).isFile())return fail('Not found',404);
+  res.writeHead(200,{'Content-Type':mimeMap[path.extname(file)]||'application/octet-stream','Cache-Control':file.endsWith('index.html')?'no-cache':'public, max-age=3600'});
+  fs.createReadStream(file).pipe(res);
+}
+const server=http.createServer(async(req,res)=>{
+  res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','no-referrer');
+  // Telegram WebView needs embedding; CSP frame-ancestors restricts framing.
+  res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https:; connect-src 'self'; frame-ancestors 'self' https://web.telegram.org; object-src 'none'; base-uri 'none'");
+  try{const uri=new URL(req.url,`http://${req.headers.host||'localhost'}`);if(uri.pathname.startsWith('/api/'))await api(req,res,uri);else if(req.method==='GET'||req.method==='HEAD')await serve(req,res,uri.pathname);else fail('Method not allowed',405);}catch(e){if(!res.headersSent)err(res,e);else res.destroy();}
+});
+async function telegramCall(method,body){const response=await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(36000)});const data=await response.json();if(!data.ok)throw new Error(`Telegram ${method} error: ${data.error_code}`);return data.result;}
+async function polling(){let offset=0;const appUrl=process.env.APP_BASE_URL;
+ if(appUrl?.startsWith('https://'))try{await telegramCall('setChatMenuButton',{menu_button:{type:'web_app',text:'Open FieldOps',web_app:{url:appUrl}}});}catch(e){console.error('Menu setup',e.message);}
+ while(true){try{
+   const updates=await telegramCall('getUpdates',{offset,timeout:25,allowed_updates:['message']});
+   for(const up of updates){offset=up.update_id+1;const m=up.message;if(!m?.text?.startsWith('/start'))continue;
+     const text=`WallPanels FieldOps\nYour Telegram ID: ${m.from?.id}\nShare this number with your Project Manager for access.\nTap the button below to open your workspace.`;
+     const extra=appUrl?.startsWith('https://')?{reply_markup:{inline_keyboard:[[{text:'Open FieldOps',web_app:{url:appUrl}}]]}}:{};
+     await sendTelegram(m.chat.id,text,extra);
+   }
+ }catch(e){console.error('Bot polling:',e.message);await new Promise(r=>setTimeout(r,6000));}}
+}
+try{const demoOnly=process.env.NODE_ENV!=='production'&&process.env.DEMO_ONLY==='true';if(!demoOnly)requireEnv();server.listen(port,'0.0.0.0',()=>{console.log(`WallPanels FieldOps listening on ${port}${demoOnly?' (preview-only)':''}`);if(!demoOnly)void polling();});}catch(e){console.error('Cannot start FieldOps:',e.message);process.exit(1);}

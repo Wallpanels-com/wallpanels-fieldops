@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+node_modules/
+.DS_Store
+*.log
+*.zip
+fieldops.docx
+Fields.docx
+docs/style-reference.png
+*.pem
+*.key
