@@ -14,6 +14,9 @@ test('Mini App demo boots without Telegram or network and renders key views',asy
  assert.match(appRoot.innerHTML,/Miami Residence/);
  assert.doesNotMatch(appRoot.innerHTML,/preview-banner/);
  assert.match(appRoot.innerHTML,/Active Projects/);
+ assert.doesNotMatch(appRoot.innerHTML,/Recent projects/);
+ assert.match(appRoot.innerHTML,/class="nav-create"/);
+ assert.match(appRoot.innerHTML,/data-modal="create"/);
  assert.match(appRoot.innerHTML,/WALLPANELS/);
  const fire=(action,attributes={})=>handlers.click({target:{closest:()=>({dataset:{action,...attributes},classList:{contains:()=>false}})},preventDefault:()=>{}});
  fire('open-project',{id:'demo-project'});await new Promise(r=>setTimeout(r,70));
