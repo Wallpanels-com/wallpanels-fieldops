@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import {fileURLToPath} from 'node:url';
 import {validateTelegramInitData,issueSession,readSession} from './auth.js';
 import {table,insert,update,remove,one,uploadObject,deleteObject,signedUrl,rpc} from './supabase.js';
-import {stagesFor,stageComplete,DAY_CHECKS} from './templates.js';
+import {stagesFor,stageComplete,canExcludeRequirement,DAY_CHECKS} from './templates.js';
 import {validateUploadMetadata,inspectUploadStream} from './uploads.js';
 import {assertProjectSubmittable} from './validation.js';
 
@@ -49,14 +49,22 @@ async function projectAccess(u,id,{pmOnly=false}={}){
  if(pmOnly && !isPm(u))fail('Project Manager required',403);
  return p;
 }
+async function projectRole(u,projectId){
+ if(isPm(u))return u.role;
+ return (await one('project_members',{project_id:f(projectId),user_id:f(u.id)}))?.role||null;
+}
+async function requireForeman(u,projectId){
+ const role=await projectRole(u,projectId);if(!['admin','pm','foreman'].includes(role))fail('Только бригадир или руководитель может выполнить это действие',403);return role;
+}
 const bundleCache=new Map(),bundleInflight=new Map(),BUNDLE_CACHE_MS=20_000;
+function invalidateProject(projectId){for(const key of bundleCache.keys())if(key.endsWith(`:${projectId}`))bundleCache.delete(key);}
 async function buildProjectBundle(u,p){
  const id=p.id;
- const [stages,checks,results,media,issues,days,members,exceptions,confirmations,owner,comments,completions]=await Promise.all([
+ const [stages,checks,results,media,issues,days,members,exceptions,confirmations,owner,comments,completions,events]=await Promise.all([
   table('project_stages',{filters:{project_id:f(id)},order:'sort_order.asc'}),
   table('stage_check_items',{filters:{project_id:f(id)},order:'sort_order.asc'}),
   table('stage_check_results',{filters:{project_id:f(id)}}),
-  table('project_media',{filters:{project_id:f(id)},order:'created_at.desc',limit:300}),
+  table('project_media',{filters:{project_id:f(id),deleted_at:'is.null'},order:'created_at.desc',limit:500}),
   table('issues',{filters:{project_id:f(id)},order:'created_at.desc'}),
   table('daily_reports',{filters:{project_id:f(id)},order:'report_date.desc'}),
   table('project_members',{filters:{project_id:f(id)}}),
@@ -64,16 +72,20 @@ async function buildProjectBundle(u,p){
   one('client_confirmations',{project_id:f(id)}),
   p.pm_id?one('users',{id:f(p.pm_id)}):null,
   table('stage_comments',{filters:{project_id:f(id)},order:'created_at.asc'}),
-  table('stage_completions',{filters:{project_id:f(id)}})
+  table('stage_completions',{filters:{project_id:f(id)}}),
+  table('project_events',{filters:{project_id:f(id)},order:'created_at.desc',limit:50}).catch(()=>[])
  ]);
- const userIds=[...new Set([...members.map(m=>m.user_id),...media.map(m=>m.uploaded_by),...comments.map(m=>m.author_id),p.pm_id].filter(Boolean))];
+ const userIds=[...new Set([...members.map(m=>m.user_id),...media.map(m=>m.uploaded_by),...comments.map(m=>m.author_id),...exceptions.flatMap(x=>[x.requested_by,x.reviewed_by]),...events.map(x=>x.actor_id),p.pm_id].filter(Boolean))];
  const users=userIds.length?await table('users',{filters:{id:`in.(${userIds.join(',')})`}}).catch(()=>[]):[];
  const mappedChecks=checks.map(c=>({...c,result_status:results.find(x=>x.check_item_id===c.id)?.status||'pending',completed_by:results.find(x=>x.check_item_id===c.id)?.completed_by||null}));
  const person=id=>users.find(x=>x.id===id);
  const signedMedia=await Promise.all(media.map(async m=>({...m,url:await signedUrl(m.storage_path).catch(()=>null),uploader:person(m.uploaded_by)?{id:m.uploaded_by,first_name:person(m.uploaded_by).first_name,last_name:person(m.uploaded_by).last_name}:null})));
  const enriched=stages.map(s=>({...s,completion:stageComplete(s,media,mappedChecks,exceptions),completed:completions.find(x=>x.stage_id===s.id)||null}));
  const enrichedComments=comments.map(c=>({...c,author:person(c.author_id)?{id:c.author_id,first_name:person(c.author_id).first_name,last_name:person(c.author_id).last_name}:null,can_edit:c.author_id===u.id}));
- return {project:p,stages:enriched,checks:mappedChecks,media:signedMedia,issues,days,members,people:users.map(x=>({id:x.id,telegram_id:x.telegram_id,username:x.username,first_name:x.first_name,last_name:x.last_name,role:x.role,photo_url:x.photo_url,is_active:x.is_active})),comments:enrichedComments,exceptions,confirmation:confirmations,pm:owner?{id:owner.id,first_name:owner.first_name,last_name:owner.last_name,username:owner.username,telegram_id:owner.telegram_id,photo_url:owner.photo_url}:null,dayChecks:DAY_CHECKS};
+ const publicPerson=id=>{const x=person(id);return x?{id:x.id,first_name:x.first_name,last_name:x.last_name,username:x.username,photo_url:x.photo_url}:null;};
+ const enrichedExceptions=exceptions.map(x=>({...x,requester:publicPerson(x.requested_by),reviewer:publicPerson(x.reviewed_by)}));
+ const enrichedEvents=events.map(x=>({...x,actor:publicPerson(x.actor_id)}));
+ return {project:p,stages:enriched,checks:mappedChecks,media:signedMedia,issues,days,members,people:users.map(x=>({id:x.id,telegram_id:x.telegram_id,username:x.username,first_name:x.first_name,last_name:x.last_name,role:x.role,photo_url:x.photo_url,is_active:x.is_active})),comments:enrichedComments,exceptions:enrichedExceptions,events:enrichedEvents,confirmation:confirmations,pm:owner?{id:owner.id,first_name:owner.first_name,last_name:owner.last_name,username:owner.username,telegram_id:owner.telegram_id,photo_url:owner.photo_url}:null,dayChecks:DAY_CHECKS};
 }
 async function projectBundle(u,id,{fresh=false}={}){
  const p=await projectAccess(u,id),key=`${u.id}:${id}`,cached=bundleCache.get(key);
@@ -85,11 +97,23 @@ async function projectBundle(u,id,{fresh=false}={}){
 }
 async function warmProjectBundles(u,projects){for(const p of projects.slice(0,3)){try{await projectBundle(u,p.id);}catch{}}}
 async function sendTelegram(chatId,text,extra={}){
- if(!BOT_TOKEN||!chatId)return;
- try{const c=new AbortController();const t=setTimeout(()=>c.abort(),9000);const r=await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chatId,text,...extra}),signal:c.signal});clearTimeout(t);if(!r.ok)console.error('Telegram notification failed',r.status);}catch(e){console.error('Telegram notification transport error',e.message);}
+ if(!BOT_TOKEN||!chatId)return {ok:false,error:'not configured'};
+ try{const c=new AbortController();const t=setTimeout(()=>c.abort(),9000);const r=await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chatId,text,...extra}),signal:c.signal});clearTimeout(t);if(!r.ok){console.error('Telegram notification failed',r.status);return {ok:false,error:`HTTP ${r.status}`};}return {ok:true};}catch(e){console.error('Telegram notification transport error',e.message);return {ok:false,error:e.message};}
 }
 async function notifyPM(project,text){if(!project.pm_id)return;const pm=await one('users',{id:f(project.pm_id)});if(pm)void sendTelegram(pm.telegram_id,text);}
 async function notifyCrew(project,text){const members=await table('project_members',{filters:{project_id:f(project.id)}});for(const m of members){const person=await one('users',{id:f(m.user_id)});if(person?.is_active)void sendTelegram(person.telegram_id,text);}}
+async function createProjectEvent(projectId,eventType,title,detail,actorId,referenceType,referenceId){
+ const row=(await insert('project_events',{project_id:projectId,event_type:eventType,title,detail,actor_id:actorId,reference_type:referenceType,reference_id:referenceId}))[0];invalidateProject(projectId);return row;
+}
+async function notifyManagers(project,eventKey,text){
+ const recipients=new Set(managerIds);if(project.pm_id){const pm=await one('users',{id:f(project.pm_id)});if(pm?.telegram_id)recipients.add(String(pm.telegram_id));}
+ for(const chatId of recipients){
+  try{if(await one('notification_deliveries',{event_key:f(eventKey),recipient_telegram_id:f(chatId)}))continue;
+   const delivery=(await insert('notification_deliveries',{event_key:eventKey,recipient_telegram_id:chatId,status:'sending'}))[0];
+   const sent=await sendTelegram(chatId,text);await update('notification_deliveries',{status:sent.ok?'sent':'failed',error:sent.ok?null:String(sent.error||'delivery failed').slice(0,300),attempted_at:new Date().toISOString()},{id:f(delivery.id)});
+  }catch(e){console.error('Manager notification record failed',e.message);}
+ }
+}
 function parseId(pathname,prefix){const m=pathname.match(new RegExp(`^${prefix}/([0-9a-f-]{36})$`,'i'));return m?.[1]||null;}
 
 async function api(req,res,uri){
@@ -199,27 +223,29 @@ async function api(req,res,uri){
   const item=await one('stage_check_items',{id:f(match[1])});if(!item)fail('Checklist item not found',404);
   const project=await projectAccess(u,item.project_id);if(!['active','needs_changes'].includes(project.status))fail('Project locked for editing',409);const b=await json(req);
   const status=b.done===true?'done':'pending';const out=await insert('stage_check_results',{project_id:item.project_id,check_item_id:item.id,status,completed_by:status==='done'?u.id:null,updated_at:new Date().toISOString()},{upsert:true,conflict:'check_item_id'});
+  if(status==='pending')await remove('stage_completions',{stage_id:f(item.stage_id)});
+  invalidateProject(item.project_id);
   return ok(res,{result:out[0]});
  }
  match=pathname.match(/^\/api\/stages\/([0-9a-f-]{36})\/complete$/i);
  if(match&&method==='POST'){
-  const stage=await one('project_stages',{id:f(match[1])});if(!stage)fail('Stage missing',404);await projectAccess(u,stage.project_id);
-  const bundle=await projectBundle(u,stage.project_id);const current=bundle.stages.find(x=>x.id===stage.id);if(!current?.completion.done)fail(`Сначала выполните: ${[...(current?.completion.missingMedia||[]),...(current?.completion.missingChecks||[])].join(', ')}`,409);
+  const stage=await one('project_stages',{id:f(match[1])});if(!stage)fail('Stage missing',404);await projectAccess(u,stage.project_id);await requireForeman(u,stage.project_id);
+  const bundle=await projectBundle(u,stage.project_id,{fresh:true});const current=bundle.stages.find(x=>x.id===stage.id);if(!current?.completion.done)fail(`Сначала выполните: ${[...(current?.completion.missingMedia||[]),...(current?.completion.missingChecks||[])].join(', ')}`,409);
   const existing=await one('stage_completions',{stage_id:f(stage.id)});if(existing)return ok(res,{completion:existing});
-  const result=await insert('stage_completions',{project_id:stage.project_id,stage_id:stage.id,completed_by:u.id,completed_at:new Date().toISOString()},{upsert:true,conflict:'stage_id'});return ok(res,{completion:result[0]});
+  const result=await insert('stage_completions',{project_id:stage.project_id,stage_id:stage.id,completed_by:u.id,completed_at:new Date().toISOString()},{upsert:true,conflict:'stage_id'});invalidateProject(stage.project_id);return ok(res,{completion:result[0]});
  }
  match=pathname.match(/^\/api\/stages\/([0-9a-f-]{36})\/comments$/i);
  if(match&&method==='POST'){
   const stage=await one('project_stages',{id:f(match[1])});if(!stage)fail('Stage missing',404);await projectAccess(u,stage.project_id);const b=await json(req);
-  const comment=(await insert('stage_comments',{project_id:stage.project_id,stage_id:stage.id,author_id:u.id,body:str(b.body,2000)}))[0];return ok(res,{comment},201);
+  const comment=(await insert('stage_comments',{project_id:stage.project_id,stage_id:stage.id,author_id:u.id,body:str(b.body,2000)}))[0];invalidateProject(stage.project_id);return ok(res,{comment:{...comment,author:{id:u.id,first_name:u.first_name,last_name:u.last_name},can_edit:true}},201);
  }
  match=pathname.match(/^\/api\/comments\/([0-9a-f-]{36})$/i);
  if(match&&method==='PATCH'){
   const comment=await one('stage_comments',{id:f(match[1])});if(!comment)fail('Comment missing',404);await projectAccess(u,comment.project_id);if(comment.author_id!==u.id)fail('Only the author can edit this comment',403);const b=await json(req);
-  const result=(await update('stage_comments',{body:str(b.body,2000),updated_at:new Date().toISOString()},{id:f(comment.id)}))[0];return ok(res,{comment:result});
+  const result=(await update('stage_comments',{body:str(b.body,2000),updated_at:new Date().toISOString()},{id:f(comment.id)}))[0];invalidateProject(comment.project_id);return ok(res,{comment:{...result,author:{id:u.id,first_name:u.first_name,last_name:u.last_name},can_edit:true}});
  }
  if(match&&method==='DELETE'){
-  const comment=await one('stage_comments',{id:f(match[1])});if(!comment)fail('Comment missing',404);await projectAccess(u,comment.project_id);if(comment.author_id!==u.id)fail('Only the author can delete this comment',403);await remove('stage_comments',{id:f(comment.id)});return ok(res,{deleted:true});
+  const comment=await one('stage_comments',{id:f(match[1])});if(!comment)fail('Comment missing',404);await projectAccess(u,comment.project_id);if(comment.author_id!==u.id)fail('Only the author can delete this comment',403);await remove('stage_comments',{id:f(comment.id)});invalidateProject(comment.project_id);return ok(res,{deleted:true});
  }
  match=pathname.match(/^\/api\/projects\/([0-9a-f-]{36})\/media$/i);
  if(match&&method==='POST'){
@@ -233,14 +259,28 @@ async function api(req,res,uri){
   if(dayId){if(!uuid(dayId))fail('Invalid day');day=await one('daily_reports',{id:f(dayId),project_id:f(p.id)});if(!day||!['open','changes'].includes(day.status))fail('Daily report not editable',409);if(category!=='daily_site')fail('Day category invalid');}
   const mime=String(req.headers['content-type']||'').split(';')[0].toLowerCase();const size=Number(req.headers['content-length']);
   const {kind,extension:ext}=validateUploadMetadata(mime,size);
+  if(day&&kind!=='image')fail('Ежедневный отчёт принимает только фотографии',415);
   if(stage){const requirement=(stage.media_requirements||[]).find(r=>r.key===category);if(!requirement||requirement.kind!==kind)fail('File type does not match selected category');}
-  const storagePath=`projects/${p.id}/${crypto.randomUUID()}.${ext}`;const filename=cleanFileName(req.headers['x-file-name']);
+  const storagePath=`projects/${p.id}/${crypto.randomUUID()}.${ext}`;const filename=cleanFileName(req.headers['x-file-name']);let mediaRecord=null;
   const uploadStream=await inspectUploadStream(req,mime,size);
   await uploadObject(storagePath,uploadStream,mime,size);
   try{
-    const items=await insert('project_media',{project_id:p.id,stage_id:stage?.id||null,daily_report_id:day?.id||null,issue_id:issue?.id||null,category_key:category,kind,file_name:filename,mime_type:mime,byte_size:size,storage_path:storagePath,uploaded_by:u.id});
-    return ok(res,{media:{...items[0],url:await signedUrl(storagePath)}},201);
-  }catch(e){try{await deleteObject(storagePath);}catch{}throw e;}
+    const items=await insert('project_media',{project_id:p.id,stage_id:stage?.id||null,daily_report_id:day?.id||null,issue_id:issue?.id||null,category_key:category,kind,file_name:filename,mime_type:mime,byte_size:size,storage_path:storagePath,uploaded_by:u.id});mediaRecord=items[0]||null;
+    const saved=items[0]&&await one('project_media',{id:f(items[0].id),deleted_at:'is.null'});if(!saved||saved.storage_path!==storagePath)fail('Upload could not be verified',502);
+    invalidateProject(p.id);return ok(res,{media:{...saved,url:await signedUrl(storagePath)}},201);
+  }catch(e){if(mediaRecord?.id)try{await update('project_media',{deleted_at:new Date().toISOString(),deleted_by:u.id,deletion_reason:'Upload verification failed'},{id:f(mediaRecord.id)});}catch{}try{await deleteObject(storagePath);}catch{}throw e;}
+ }
+ match=pathname.match(/^\/api\/media\/([0-9a-f-]{36})$/i);
+ if(match&&method==='DELETE'){
+  const media=await one('project_media',{id:f(match[1]),deleted_at:'is.null'});if(!media)fail('Файл не найден',404);
+  const p=await projectAccess(u,media.project_id);if(!['active','needs_changes'].includes(p.status))fail('Сначала верните проект на исправление',409);
+  const role=await projectRole(u,p.id);if(media.uploaded_by!==u.id&&!['admin','pm','foreman'].includes(role))fail('Удалить файл может автор, бригадир или руководитель',403);
+  if(media.daily_report_id){const day=await one('daily_reports',{id:f(media.daily_report_id)});if(!day||!['open','changes'].includes(day.status))fail('Сначала верните ежедневный отчёт на исправление',409);}
+  if(media.issue_id){const issue=await one('issues',{id:f(media.issue_id)});if(!issue||issue.status!=='open')fail('Материалы закрытой проблемы заблокированы',409);}
+  const updated=(await update('project_media',{deleted_at:new Date().toISOString(),deleted_by:u.id,deletion_reason:'Ошибочная загрузка / замена'},{id:f(media.id),deleted_at:'is.null'}))[0];if(!updated)fail('Файл уже удалён',409);
+  if(media.stage_id)await remove('stage_completions',{stage_id:f(media.stage_id)});
+  try{await deleteObject(media.storage_path);}catch(e){console.error('Storage cleanup after media deletion failed',e.message);}
+  invalidateProject(p.id);return ok(res,{deleted:true,media_id:media.id});
  }
  match=pathname.match(/^\/api\/projects\/([0-9a-f-]{36})\/days$/i);
  if(match&&method==='POST'){
@@ -255,17 +295,17 @@ async function api(req,res,uri){
   const day=await one('daily_reports',{id:f(match[1])});if(!day)fail('Report missing',404);const project=await projectAccess(u,day.project_id);if(!['active','needs_changes'].includes(project.status))fail('Project locked',409);
   if(!['open','changes'].includes(day.status))fail('Report locked',409);
   const b=await json(req);if(!DAY_CHECKS.some(c=>c.key===b.key)||typeof b.done!=='boolean')fail('Invalid checklist item');
-  const checks={...(day.checks||{}),[b.key]:b.done};const out=await update('daily_reports',{checks},{id:f(day.id)});return ok(res,{day:out[0]});
+  const checks={...(day.checks||{}),[b.key]:b.done};const out=await update('daily_reports',{checks},{id:f(day.id)});invalidateProject(day.project_id);return ok(res,{day:out[0]});
  }
  match=pathname.match(/^\/api\/days\/([0-9a-f-]{36})\/submit$/i);
  if(match&&method==='POST'){
-  const day=await one('daily_reports',{id:f(match[1])});if(!day)fail('Report missing',404);const p=await projectAccess(u,day.project_id);
+  const day=await one('daily_reports',{id:f(match[1])});if(!day)fail('Report missing',404);const p=await projectAccess(u,day.project_id);await requireForeman(u,p.id);
   if(!['open','changes'].includes(day.status))fail('Report not editable',409);
-  const photos=await table('project_media',{filters:{daily_report_id:f(day.id)}});
+  const photos=await table('project_media',{filters:{daily_report_id:f(day.id),deleted_at:'is.null'}});
   if(!photos.some(x=>x.kind==='image'&&x.category_key==='daily_site'))fail('Upload at least one end-of-day photo',409);
   const missing=DAY_CHECKS.filter(c=>!day.checks?.[c.key]);if(missing.length)fail(`Complete daily checklist: ${missing.map(x=>x.label).join(', ')}`,409);
   const r=await update('daily_reports',{status:'submitted',submitted_at:new Date().toISOString(),submitted_by:u.id},{id:f(day.id)});
-  await notifyPM(p,`FieldOps: End-of-day report submitted\n${p.title}\n${day.report_date}`);return ok(res,{day:r[0]});
+  invalidateProject(p.id);await notifyPM(p,`FieldOps: End-of-day report submitted\n${p.title}\n${day.report_date}`);return ok(res,{day:r[0]});
  }
  match=pathname.match(/^\/api\/days\/([0-9a-f-]{36})\/review$/i);
  if(match&&method==='POST'){
@@ -281,13 +321,14 @@ async function api(req,res,uri){
   const p=await projectAccess(u,match[1]);if(!['active','needs_changes'].includes(p.status))fail('Project locked',409);const b=await json(req);
   const kind=['damage','quality','change_request','other'].includes(b.kind)?b.kind:'other';
   const issue=(await insert('issues',{project_id:p.id,reported_by:u.id,kind,title:str(b.title,120),description:str(b.description,1500),status:'open'}))[0];
-  await notifyPM(p,`FieldOps ISSUE — ${p.title}\n${issue.title}\nType: ${kind}\nReview immediately. Any affected work must stop pending instructions.`);
+  const event=await createProjectEvent(p.id,'issue_reported',`Проблема: ${issue.title}`,issue.description,u.id,'issue',issue.id);
+  void notifyManagers(p,`event:${event.id}`,`FieldOps ISSUE — ${p.title}\n${issue.title}\nType: ${kind}\nReview immediately. Any affected work must stop pending instructions.`);
   return ok(res,{issue},201);
  }
  match=pathname.match(/^\/api\/issues\/([0-9a-f-]{36})\/resolve$/i);
  if(match&&method==='POST'){
   const issue=await one('issues',{id:f(match[1])});if(!issue)fail('Issue not found',404);await projectAccess(u,issue.project_id,{pmOnly:true});const b=await json(req);
-  if(['damage','quality'].includes(issue.kind)&&!(await one('project_media',{issue_id:f(issue.id),kind:'eq.image'})))fail('Add photographic evidence before resolving this issue',409);
+  if(['damage','quality'].includes(issue.kind)&&!(await one('project_media',{issue_id:f(issue.id),kind:'eq.image',deleted_at:'is.null'})))fail('Add photographic evidence before resolving this issue',409);
   const result=(await update('issues',{status:'resolved',resolution:str(b.resolution,1500),resolved_by:u.id,resolved_at:new Date().toISOString()},{id:f(issue.id)}))[0];const reporter=await one('users',{id:f(issue.reported_by)});if(reporter)void sendTelegram(reporter.telegram_id,`FieldOps issue resolved: ${issue.title}\n${result.resolution}`);return ok(res,{issue:result});
  }
  match=pathname.match(/^\/api\/projects\/([0-9a-f-]{36})\/exceptions$/i);
@@ -295,19 +336,22 @@ async function api(req,res,uri){
   const p=await projectAccess(u,match[1]);if(!['active','needs_changes'].includes(p.status))fail('Project locked',409);const b=await json(req);
   const stage=await one('project_stages',{id:f(b.stage_id),project_id:f(p.id)});if(!stage)fail('Invalid stage');
   const target=(stage.media_requirements||[]).find(x=>x.key===b.category_key&&x.required);if(!target)fail('Exception not applicable');
-  if(['before_video','after_video','flags'].includes(target.key))fail('This evidence is mandatory and cannot be marked N/A',409);
+  if(!canExcludeRequirement(stage,target))fail('Обязательные материалы ДО/ПОСЛЕ и фото флагов нельзя исключить',409);
   const existing=await one('stage_exceptions',{stage_id:f(stage.id),category_key:f(b.category_key)});
   if(existing?.status==='approved')fail('Already approved',409);
   const payload={project_id:p.id,stage_id:stage.id,category_key:target.key,reason:str(b.reason,500),requested_by:u.id,status:'pending',reviewed_by:null,reviewed_at:null};
   const entry=existing?(await update('stage_exceptions',payload,{id:f(existing.id)}))[0]:(await insert('stage_exceptions',payload))[0];
-  await notifyPM(p,`FieldOps: N/A approval requested\n${p.title}\n${stage.title} → ${target.label}\nReason: ${payload.reason}`);
+  const event=await createProjectEvent(p.id,'exception_requested',`Запрошено исключение: ${target.label}`,payload.reason,u.id,'stage_exception',entry.id);
+  void notifyManagers(p,`event:${event.id}`,`FieldOps: N/A approval requested\n${p.title}\n${stage.title} → ${target.label}\nReason: ${payload.reason}`);
   return ok(res,{exception:entry});
  }
  match=pathname.match(/^\/api\/exceptions\/([0-9a-f-]{36})\/review$/i);
  if(match&&method==='POST'){
   const item=await one('stage_exceptions',{id:f(match[1])});if(!item)fail('Exception missing',404);await projectAccess(u,item.project_id,{pmOnly:true});const b=await json(req);
   if(!['approved','rejected'].includes(b.status))fail('Invalid status');
-  const r=(await update('stage_exceptions',{status:b.status,reviewed_by:u.id,reviewed_at:new Date().toISOString()},{id:f(item.id)}))[0];const requester=await one('users',{id:f(item.requested_by)});if(requester)void sendTelegram(requester.telegram_id,`FieldOps photo exception ${b.status}\n${item.category_key}`);return ok(res,{exception:r});
+  const reviewedAt=new Date().toISOString();const r=(await update('stage_exceptions',{status:b.status,reviewed_by:u.id,reviewed_at:reviewedAt},{id:f(item.id)}))[0];
+  await createProjectEvent(item.project_id,'exception_reviewed',`Исключение ${b.status==='approved'?'одобрено':'отклонено'}`,item.reason,u.id,'stage_exception',item.id);
+  const requester=await one('users',{id:f(item.requested_by)});if(requester)void sendTelegram(requester.telegram_id,`FieldOps photo exception ${b.status}\n${item.category_key}`);return ok(res,{exception:r});
  }
  match=pathname.match(/^\/api\/projects\/([0-9a-f-]{36})\/confirmation$/i);
  if(match&&method==='POST'){
@@ -319,14 +363,15 @@ async function api(req,res,uri){
  match=pathname.match(/^\/api\/projects\/([0-9a-f-]{36})\/submit$/i);
  if(match&&method==='POST'){
   const p=await projectAccess(u,match[1]);if(!['active','needs_changes'].includes(p.status))fail('Project cannot be submitted',409);
-  const bundle=await projectBundle(u,p.id);assertProjectSubmittable(bundle);
+  const bundle=await projectBundle(u,p.id,{fresh:true});assertProjectSubmittable(bundle);
   const result=(await update('projects',{status:'in_review',submitted_by:u.id,submitted_at:new Date().toISOString()},{id:f(p.id)}))[0];await notifyPM(p,`FieldOps: Project ready for review\n${p.title}`);return ok(res,{project:result});
  }
  match=pathname.match(/^\/api\/projects\/([0-9a-f-]{36})\/review$/i);
  if(match&&method==='POST'){
-  const p=await projectAccess(u,match[1],{pmOnly:true});if(p.status!=='in_review')fail('Project not in review',409);
-  if(p.submitted_by===u.id&&u.role!=='admin')fail('Self-approval restricted',403);const b=await json(req);
+  const p=await projectAccess(u,match[1],{pmOnly:true});if(!['in_review','completed'].includes(p.status))fail('Project not in review',409);
+  if(p.status==='in_review'&&p.submitted_by===u.id&&u.role!=='admin')fail('Self-approval restricted',403);const b=await json(req);
   if(!['completed','needs_changes'].includes(b.status))fail('Invalid review');const note=str(b.note||'',1000,false);
+  if(p.status==='completed'&&b.status!=='needs_changes')fail('Completed project can only be returned for corrections',409);
   if(b.status==='needs_changes'&&!note)fail('Please explain requested changes');
   const result=(await update('projects',{status:b.status,review_note:note,reviewed_by:u.id,reviewed_at:new Date().toISOString()},{id:f(p.id)}))[0];await notifyCrew(p,`FieldOps project ${b.status==='completed'?'approved':'returned for corrections'}\n${p.title}${note?'\nPM: '+note:''}`);return ok(res,{project:result});
  }

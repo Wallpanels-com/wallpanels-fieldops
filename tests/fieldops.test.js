@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import {validateTelegramInitData,issueSession,readSession} from '../server/auth.js';
-import {stagesFor,stageComplete,DAY_CHECKS} from '../server/templates.js';
+import {stagesFor,stageComplete,canExcludeRequirement,DAY_CHECKS} from '../server/templates.js';
 
 const bot='TEST_BOT_TOKEN_NOT_REAL';
 function buildTelegram(user={id:12345678,first_name:'Tester'},modern=false){
@@ -37,10 +37,19 @@ test('All 7 default stages and daily checklist are defined',()=>{
  assert.equal(DAY_CHECKS.length,4);
 });
 test('Stage cannot be completed without every required photo/video and check',()=>{
- const stage={id:'st1',media_requirements:[{key:'flags',label:'Flag',required:true,kind:'image'},{key:'video',label:'Video',kind:'video',required:true}]};
+ const stage={id:'st1',stage_key:'progress',media_requirements:[{key:'flags',label:'Flag',required:true,kind:'image'},{key:'video',label:'Video',kind:'video',required:true}]};
  const media=[{stage_id:'st1',category_key:'flags',kind:'image'}];
  const checks=[{stage_id:'st1',label:'Arrived',required:true,result_status:'done'}];
  assert.equal(stageComplete(stage,media,checks).done,false);
  assert.equal(stageComplete(stage,media,checks).missingMedia[0],'Video');
  assert.equal(stageComplete(stage,media,checks,[{stage_id:'st1',category_key:'video',status:'approved'}]).done,true);
+});
+test('N/A never bypasses required flag or BEFORE/AFTER evidence',()=>{
+ const required={key:'overview',required:true};
+ assert.equal(canExcludeRequirement({stage_key:'before'},required),false);
+ assert.equal(canExcludeRequirement({stage_key:'installed'},{key:'finished_details',required:true}),false);
+ assert.equal(canExcludeRequirement({stage_key:'progress'},{key:'flags',required:true}),false);
+ assert.equal(canExcludeRequirement({stage_key:'protection'},{key:'safe_work_zone',required:true}),true);
+ const protectedStage={id:'st2',stage_key:'before',media_requirements:[{key:'overview',label:'Фото ДО',required:true,kind:'image'}]};
+ assert.equal(stageComplete(protectedStage,[],[],[{stage_id:'st2',category_key:'overview',status:'approved'}]).done,false);
 });

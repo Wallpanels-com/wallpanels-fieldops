@@ -59,11 +59,19 @@ export const DAY_CHECKS = [
   {key:'no_hazards',label:'No exposed screws, unsafe sharp edges or hazards'},
   {key:'pm_updated',label:'Project Manager / client informed of daily status'}
 ];
+export function canExcludeRequirement(stage, requirement) {
+  if (!requirement?.required) return false;
+  // WallPanels evidence policy: flags and every required BEFORE/AFTER photo or
+  // video are never eligible for N/A approval.
+  if (requirement.key === 'flags') return false;
+  if (['before', 'installed'].includes(stage?.stage_key)) return false;
+  return true;
+}
 export function stageComplete(stage, allMedia, allChecks, approvedExceptions = []) {
   const mediaOfStage = allMedia.filter(m => m.stage_id === stage.id);
   const checks = allChecks.filter(c => c.stage_id === stage.id);
   const missingMedia = (stage.media_requirements || []).filter(r => r.required && !mediaOfStage.some(m => m.category_key === r.key && m.kind === r.kind) &&
-    !approvedExceptions.some(e => e.stage_id === stage.id && e.category_key === r.key && e.status === 'approved')).map(r=>r.label);
+    !(canExcludeRequirement(stage,r) && approvedExceptions.some(e => e.stage_id === stage.id && e.category_key === r.key && e.status === 'approved'))).map(r=>r.label);
   const missingChecks = checks.filter(c => c.required && c.result_status !== 'done').map(c=>c.label);
   return { done:missingMedia.length === 0 && missingChecks.length === 0, missingMedia, missingChecks };
 }

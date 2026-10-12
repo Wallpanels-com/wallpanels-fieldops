@@ -26,11 +26,20 @@ export async function request(route,options={}){
 }
 const mimeByExtension={jpg:'image/jpeg',jpeg:'image/jpeg',png:'image/png',webp:'image/webp',heic:'image/heic',heif:'image/heif',mp4:'video/mp4',mov:'video/quicktime',webm:'video/webm'};
 export function uploadContentType(file){return file.type||mimeByExtension[file.name.split('.').pop()?.toLowerCase()]||'';}
-export async function uploadMedia(projectId,{stageId,dayId,issueId,category,file}){
+export async function uploadMedia(projectId,{stageId,dayId,issueId,category,file,onProgress}){
  const query=new URLSearchParams({category,...(stageId?{stage_id:stageId}:{}),...(dayId?{day_id:dayId}:{}),...(issueId?{issue_id:issueId}:{})});
  const contentType=uploadContentType(file);if(!contentType)throw new Error(`Unsupported file format: ${file.name}`);
- const r=await fetch(`${API_BASE}/projects/${projectId}/media?${query}`,{
-  method:'POST',headers:{Authorization:`Bearer ${state.token}`,'Content-Type':contentType,'X-File-Name':encodeURIComponent(file.name)},body:file});
- const result=await r.json().catch(()=>({}));if(!r.ok)throw new Error(result.error||`Upload failed: ${file.name}`);
- return result.media;
+ return new Promise((resolve,reject)=>{
+  const xhr=new XMLHttpRequest();xhr.open('POST',`${API_BASE}/projects/${projectId}/media?${query}`);xhr.timeout=190000;
+  xhr.setRequestHeader('Authorization',`Bearer ${state.token}`);xhr.setRequestHeader('Content-Type',contentType);xhr.setRequestHeader('X-File-Name',encodeURIComponent(file.name));
+  xhr.upload.onprogress=e=>{if(e.lengthComputable)onProgress?.(Math.max(1,Math.min(99,Math.round(e.loaded/e.total*100))));};
+  xhr.onerror=()=>reject(Object.assign(new Error(`Сеть прервала загрузку: ${file.name}`),{retryable:true}));
+  xhr.ontimeout=()=>reject(Object.assign(new Error(`Загрузка превысила лимит времени: ${file.name}`),{retryable:true}));
+  xhr.onload=()=>{let result={};try{result=JSON.parse(xhr.responseText||'{}');}catch{}
+   if(xhr.status<200||xhr.status>=300)return reject(Object.assign(new Error(result.error||`Не удалось загрузить ${file.name}`),{status:xhr.status,retryable:xhr.status===0||xhr.status===408||xhr.status===429||xhr.status>=500}));
+   if(!result.media?.id||!result.media?.storage_path)return reject(Object.assign(new Error(`Сервер не подтвердил сохранение ${file.name}`),{retryable:true}));
+   onProgress?.(100);resolve(result.media);
+  };
+  xhr.send(file);
+ });
 }

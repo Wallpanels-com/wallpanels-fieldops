@@ -4,6 +4,7 @@ import fs from 'node:fs';
 
 const sql=fs.readFileSync(new URL('../supabase/migrations/001_fieldops.sql',import.meta.url),'utf8');
 const productionSql=fs.readFileSync(new URL('../supabase/migrations/002_production_workflow.sql',import.meta.url),'utf8');
+const hardeningSql=fs.readFileSync(new URL('../supabase/migrations/003_media_history_events.sql',import.meta.url),'utf8');
 
 test('Migration keeps data private and exposes only the transactional server RPC',()=>{
   assert.match(sql,/enable row level security/i);
@@ -30,4 +31,11 @@ test('Migration enforces cross-project reference integrity and immutable audit r
   assert.match(sql,/project_media_issue_project_fk/i);
   assert.match(sql,/stage_check_results_item_project_fk/i);
   assert.match(sql,/fieldops_audit_immutable/i);
+});
+test('Media history migration is additive, private and notification-safe',()=>{
+  assert.doesNotMatch(hardeningSql,/drop table|truncate/i);
+  assert.match(hardeningSql,/project_media add column if not exists deleted_at/i);
+  assert.match(hardeningSql,/create table if not exists public\.project_events/i);
+  assert.match(hardeningSql,/unique\(event_key,recipient_telegram_id\)/i);
+  assert.match(hardeningSql,/enable row level security/i);
 });
