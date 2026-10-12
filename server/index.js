@@ -95,7 +95,7 @@ async function projectBundle(u,id,{fresh=false}={}){
  const pending=buildProjectBundle(u,p).then(data=>{bundleCache.set(key,{at:Date.now(),data});return data;}).finally(()=>bundleInflight.delete(key));
  bundleInflight.set(key,pending);return pending;
 }
-async function warmProjectBundles(u,projects){for(const p of projects.slice(0,3)){try{await projectBundle(u,p.id);}catch{}}}
+async function warmProjectBundles(u,projects){await Promise.allSettled(projects.slice(0,3).map(p=>projectBundle(u,p.id)));}
 async function sendTelegram(chatId,text,extra={}){
  if(!BOT_TOKEN||!chatId)return {ok:false,error:'not configured'};
  try{const c=new AbortController();const t=setTimeout(()=>c.abort(),9000);const r=await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chatId,text,...extra}),signal:c.signal});clearTimeout(t);if(!r.ok){console.error('Telegram notification failed',r.status);return {ok:false,error:`HTTP ${r.status}`};}return {ok:true};}catch(e){console.error('Telegram notification transport error',e.message);return {ok:false,error:e.message};}
@@ -158,8 +158,8 @@ async function api(req,res,uri){
  }
  if(pathname==='/api/projects'&&method==='GET'){
   let projects,memberships;
-  if(isPm(u))projects=await table('projects',{order:'created_at.desc',limit:100});
-  else {memberships=await table('project_members',{filters:{user_id:f(u.id)}});projects=memberships.length?await table('projects',{filters:{id:`in.(${memberships.map(x=>x.project_id).join(',')})`},order:'created_at.desc',limit:100}):[];}
+  if(isPm(u))projects=await table('projects',{filters:{status:'neq.archived'},order:'created_at.desc',limit:100});
+  else {memberships=await table('project_members',{filters:{user_id:f(u.id)}});projects=memberships.length?await table('projects',{filters:{id:`in.(${memberships.map(x=>x.project_id).join(',')})`,status:'neq.archived'},order:'created_at.desc',limit:100}):[];}
   if(!projects.length)return ok(res,{projects:[]});
   memberships||=await table('project_members',{filters:{project_id:`in.(${projects.map(x=>x.id).join(',')})`}});
   const ids=[...new Set([...projects.map(x=>x.pm_id),...memberships.map(x=>x.user_id)].filter(Boolean))];
@@ -192,7 +192,7 @@ async function api(req,res,uri){
  match=pathname.match(/^\/api\/projects\/([0-9a-f-]{36})\/archive$/i);
  if(match&&method==='POST'){
   const p=await projectAccess(u,match[1],{pmOnly:true});if(p.status==='archived')return ok(res,{project:p});
-  const result=(await update('projects',{status:'archived'},{id:f(p.id)}))[0];return ok(res,{project:result});
+  const result=(await update('projects',{status:'archived'},{id:f(p.id)}))[0];invalidateProject(p.id);return ok(res,{project:result});
  }
  match=pathname.match(/^\/api\/projects\/([0-9a-f-]{36})\/assign$/i);
  if(match&&method==='POST'){
