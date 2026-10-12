@@ -8,7 +8,10 @@ export function validateTelegramInitData(initData, botToken, now = Math.floor(Da
   const hash = params.get('hash');
   const authDate = Number(params.get('auth_date'));
   if (!hash || !/^[a-f\d]{64}$/i.test(hash) || !Number.isInteger(authDate) || authDate > now+120 || now-authDate > 86400) throw Object.assign(new Error('Telegram authorization expired'),{status:401});
-  const data = [...params.entries()].filter(([k])=>k !== 'hash' && k !== 'signature').sort(([a],[b])=>a.localeCompare(b)).map(([k,v])=>`${k}=${v}`).join('\n');
+  // Telegram's bot-token HMAC covers every received field except `hash`.
+  // Modern clients include the Ed25519 `signature` field, and it must remain
+  // in this data-check-string (it is excluded only for public-key validation).
+  const data = [...params.entries()].filter(([k])=>k !== 'hash').sort(([a],[b])=>a<b?-1:a>b?1:0).map(([k,v])=>`${k}=${v}`).join('\n');
   const secret = crypto.createHmac('sha256','WebAppData').update(botToken).digest();
   const expected = crypto.createHmac('sha256',secret).update(data).digest();
   if (!crypto.timingSafeEqual(Buffer.from(hash,'hex'),expected)) throw Object.assign(new Error('Invalid Telegram signature'),{status:401});

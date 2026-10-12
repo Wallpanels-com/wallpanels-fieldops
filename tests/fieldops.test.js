@@ -5,15 +5,18 @@ import {validateTelegramInitData,issueSession,readSession} from '../server/auth.
 import {stagesFor,stageComplete,DAY_CHECKS} from '../server/templates.js';
 
 const bot='TEST_BOT_TOKEN_NOT_REAL';
-function buildTelegram(user={id:12345678,first_name:'Tester'}){
- const data={auth_date:String(Math.floor(Date.now()/1000)),query_id:'AAExample',user:JSON.stringify(user)};
- const check=Object.entries(data).sort(([a],[b])=>a.localeCompare(b)).map(([k,v])=>`${k}=${v}`).join('\n');
+function buildTelegram(user={id:12345678,first_name:'Tester'},modern=false){
+ const data={auth_date:String(Math.floor(Date.now()/1000)),query_id:'AAExample',user:JSON.stringify(user),...(modern?{signature:'telegram-ed25519-signature'}:{})};
+ const check=Object.entries(data).sort(([a],[b])=>a<b?-1:a>b?1:0).map(([k,v])=>`${k}=${v}`).join('\n');
  const secret=crypto.createHmac('sha256','WebAppData').update(bot).digest();
  const hash=crypto.createHmac('sha256',secret).update(check).digest('hex');
  return new URLSearchParams({...data,hash}).toString();
 }
 test('Telegram valid initData passes HMAC verification',()=>{
  assert.equal(validateTelegramInitData(buildTelegram(),bot).id,12345678);
+});
+test('Telegram valid initData with modern signature field passes HMAC verification',()=>{
+ assert.equal(validateTelegramInitData(buildTelegram(undefined,true),bot).id,12345678);
 });
 test('Telegram tampered data never authorizes',()=>{
  const tampered=buildTelegram().replace('Tester','Attacker');
