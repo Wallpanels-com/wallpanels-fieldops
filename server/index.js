@@ -49,8 +49,9 @@ async function projectAccess(u,id,{pmOnly=false}={}){
  if(pmOnly && !isPm(u))fail('Project Manager required',403);
  return p;
 }
-async function projectBundle(u,id){
- const p=await projectAccess(u,id);
+const bundleCache=new Map(),bundleInflight=new Map(),BUNDLE_CACHE_MS=20_000;
+async function buildProjectBundle(u,p){
+ const id=p.id;
  const [stages,checks,results,media,issues,days,members,exceptions,confirmations,owner,comments,completions]=await Promise.all([
   table('project_stages',{filters:{project_id:f(id)},order:'sort_order.asc'}),
   table('stage_check_items',{filters:{project_id:f(id)},order:'sort_order.asc'}),
@@ -74,6 +75,15 @@ async function projectBundle(u,id){
  const enrichedComments=comments.map(c=>({...c,author:person(c.author_id)?{id:c.author_id,first_name:person(c.author_id).first_name,last_name:person(c.author_id).last_name}:null,can_edit:c.author_id===u.id}));
  return {project:p,stages:enriched,checks:mappedChecks,media:signedMedia,issues,days,members,people:users.map(x=>({id:x.id,telegram_id:x.telegram_id,username:x.username,first_name:x.first_name,last_name:x.last_name,role:x.role,photo_url:x.photo_url,is_active:x.is_active})),comments:enrichedComments,exceptions,confirmation:confirmations,pm:owner?{id:owner.id,first_name:owner.first_name,last_name:owner.last_name,username:owner.username,telegram_id:owner.telegram_id,photo_url:owner.photo_url}:null,dayChecks:DAY_CHECKS};
 }
+async function projectBundle(u,id,{fresh=false}={}){
+ const p=await projectAccess(u,id),key=`${u.id}:${id}`,cached=bundleCache.get(key);
+ if(!fresh&&cached&&Date.now()-cached.at<BUNDLE_CACHE_MS)return cached.data;
+ if(!fresh&&bundleInflight.has(key))return bundleInflight.get(key);
+ if(fresh&&bundleInflight.has(key))await bundleInflight.get(key).catch(()=>{});
+ const pending=buildProjectBundle(u,p).then(data=>{bundleCache.set(key,{at:Date.now(),data});return data;}).finally(()=>bundleInflight.delete(key));
+ bundleInflight.set(key,pending);return pending;
+}
+async function warmProjectBundles(u,projects){for(const p of projects.slice(0,3)){try{await projectBundle(u,p.id);}catch{}}}
 async function sendTelegram(chatId,text,extra={}){
  if(!BOT_TOKEN||!chatId)return;
  try{const c=new AbortController();const t=setTimeout(()=>c.abort(),9000);const r=await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chatId,text,...extra}),signal:c.signal});clearTimeout(t);if(!r.ok)console.error('Telegram notification failed',r.status);}catch(e){console.error('Telegram notification transport error',e.message);}
@@ -123,11 +133,16 @@ async function api(req,res,uri){
   const bot=process.env.TELEGRAM_BOT_USERNAME;return ok(res,{invitation:{id:invitation.id,username,role,invite_url:`https://t.me/${bot}?start=invite_${token}`}},201);
  }
  if(pathname==='/api/projects'&&method==='GET'){
-  let projects;
+  let projects,memberships;
   if(isPm(u))projects=await table('projects',{order:'created_at.desc',limit:100});
-  else {const memberships=await table('project_members',{filters:{user_id:f(u.id)}});projects=memberships.length?await table('projects',{filters:{id:`in.(${memberships.map(x=>x.project_id).join(',')})`},order:'created_at.desc',limit:100}):[];}
-  const enriched=await Promise.all(projects.map(async p=>{const members=await table('project_members',{filters:{project_id:f(p.id)}});const ids=[p.pm_id,...members.map(x=>x.user_id)].filter(Boolean);const people=ids.length?await table('users',{filters:{id:`in.(${ids.join(',')})`}}):[];const publicPerson=id=>{const x=people.find(y=>y.id===id);return x?{id:x.id,first_name:x.first_name,last_name:x.last_name,username:x.username,photo_url:x.photo_url}:null;};return {...p,pm:publicPerson(p.pm_id),foreman:publicPerson(members.find(x=>x.role==='foreman')?.user_id),crew:members.map(x=>publicPerson(x.user_id)).filter(Boolean)};}));
-  return ok(res,{projects:enriched});
+  else {memberships=await table('project_members',{filters:{user_id:f(u.id)}});projects=memberships.length?await table('projects',{filters:{id:`in.(${memberships.map(x=>x.project_id).join(',')})`},order:'created_at.desc',limit:100}):[];}
+  if(!projects.length)return ok(res,{projects:[]});
+  memberships||=await table('project_members',{filters:{project_id:`in.(${projects.map(x=>x.id).join(',')})`}});
+  const ids=[...new Set([...projects.map(x=>x.pm_id),...memberships.map(x=>x.user_id)].filter(Boolean))];
+  const people=ids.length?await table('users',{filters:{id:`in.(${ids.join(',')})`}}):[];
+  const publicPerson=id=>{const x=people.find(y=>y.id===id);return x?{id:x.id,first_name:x.first_name,last_name:x.last_name,username:x.username,photo_url:x.photo_url}:null;};
+  const enriched=projects.map(p=>{const members=memberships.filter(x=>x.project_id===p.id);return {...p,pm:publicPerson(p.pm_id),foreman:publicPerson(members.find(x=>x.role==='foreman')?.user_id),crew:members.map(x=>publicPerson(x.user_id)).filter(Boolean)};});
+  ok(res,{projects:enriched});void warmProjectBundles(u,projects);return;
  }
  if(pathname==='/api/projects'&&method==='POST'){
   if(!isPm(u))fail('PM required',403);const b=await json(req);
@@ -141,7 +156,7 @@ async function api(req,res,uri){
   return ok(res,{project:p},201);
  }
  let match=pathname.match(/^\/api\/projects\/([0-9a-f-]{36})$/i);
- if(match&&method==='GET')return ok(res,await projectBundle(u,match[1]));
+ if(match&&method==='GET')return ok(res,await projectBundle(u,match[1],{fresh:uri.searchParams.get('fresh')==='1'}));
  if(match&&method==='PATCH'){
   const p=await projectAccess(u,match[1],{pmOnly:true});const b=await json(req);const patch={};
   if(b.title!==undefined)patch.title=str(b.title,120);if(b.address!==undefined)patch.address=str(b.address,300);
