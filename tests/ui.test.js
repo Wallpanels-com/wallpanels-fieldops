@@ -22,6 +22,8 @@ test('Mini App demo boots without Telegram or network and renders key views',asy
  fire('open-project',{id:'demo-project'});await new Promise(r=>setTimeout(r,70));
  assert.match(appRoot.innerHTML,/Installation stages/);
  fire('open-stage',{id:'s2'});await new Promise(r=>setTimeout(r,50));
- assert.match(appRoot.innerHTML,/Required documentation/);
+ assert.match(appRoot.innerHTML,/Обязательные материалы/);
  assert.match(appRoot.innerHTML,/BEFORE video/);
+ assert.match(appRoot.innerHTML,/Завершить этап|Этап завершён/);
+ assert.match(appRoot.innerHTML,/data-action="media-menu"/);
 });

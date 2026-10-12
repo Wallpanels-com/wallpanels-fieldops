@@ -1,5 +1,6 @@
 const API_BASE='/api';
-export const state={token:sessionStorage.getItem('fieldops_token')||'',me:null,view:'pm',projects:[],current:null,loading:false,preview:new URLSearchParams(location.search).has('preview')};
+const params=new URLSearchParams(location.search);const localHost=!location.hostname||['localhost','127.0.0.1'].includes(location.hostname);
+export const state={token:sessionStorage.getItem('fieldops_token')||'',me:null,view:'pm',projects:[],current:null,loading:false,preview:localHost&&params.has('preview'),invite:params.get('invite')||''};
 async function rawRequest(route,{method='GET',data}={}){
  const r=await fetch(`${API_BASE}${route}`,{method,headers:{...(state.token?{Authorization:`Bearer ${state.token}`} :{}),...(data?{'Content-Type':'application/json'}:{})},body:data?JSON.stringify(data):undefined});
  const result=await r.json().catch(()=>({}));
@@ -11,7 +12,7 @@ export async function loginTelegram(){
  const tg=window.Telegram?.WebApp;
  if(!tg?.initData){ if(state.preview)return null;throw new Error('Please open this Mini App from Telegram. For a visual preview, add ?preview=1 to the URL.'); }
  tg.ready();tg.expand();tg.setHeaderColor?.('#f6f5f8');tg.setBackgroundColor?.('#f6f5f8');
- const r=await rawRequest('/auth/telegram',{method:'POST',data:{initData:tg.initData}});
+ const r=await rawRequest('/auth/telegram',{method:'POST',data:{initData:tg.initData,...(state.invite?{invite:state.invite}:{})}});
  state.token=r.token;state.me=r.user;sessionStorage.setItem('fieldops_token',state.token);
  state.view=r.user.role==='installer'?'installer':'pm';return r.user;
 }
