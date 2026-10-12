@@ -14,7 +14,7 @@ export async function loginTelegram(){
  tg.ready();tg.expand();tg.setHeaderColor?.('#f6f5f8');tg.setBackgroundColor?.('#f6f5f8');
  const r=await rawRequest('/auth/telegram',{method:'POST',data:{initData:tg.initData,...(state.invite?{invite:state.invite}:{})}});
  state.token=r.token;state.me=r.user;sessionStorage.setItem('fieldops_token',state.token);
- state.view=r.user.role==='installer'?'installer':'pm';return r.user;
+ state.view=['installer','foreman'].includes(r.user.role)?'installer':'pm';return r.user;
 }
 export async function request(route,options={}){
  try{return await rawRequest(route,options);}catch(error){
